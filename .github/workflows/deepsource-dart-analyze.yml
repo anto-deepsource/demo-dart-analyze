@@ -1,0 +1,88 @@
+name: Scan with dart-analyze
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - run: flutter pub get
+
+      - name: Run flutter analyze
+        run: flutter analyze 2>&1 | tee dart_analyze.txt || true
+
+      - name: Convert to SARIF
+        run: |
+          python3 - <<'PY'
+          import json, os, re
+          from pathlib import Path
+
+          workspace = os.environ.get("GITHUB_WORKSPACE", os.getcwd())
+          ansi = re.compile(r"\x1b\[[0-9;]*m")
+          bullet_re = re.compile(
+              r"^(error|warning|info)\s+[•-]\s+(.*?)\s+[•-]\s+(.+?):(\d+):(\d+)\s+[•-]\s+(.+?)\s*$"
+          )
+
+          results, rules = [], set()
+          with open("dart_analyze.txt", encoding="utf-8", errors="replace") as f:
+              for raw in f:
+                  line = ansi.sub("", raw).strip()
+                  m = bullet_re.match(line)
+                  if not m:
+                      continue
+                  sev, msg, path, ln, col, rule = m.groups()
+                  level = {"error": "error", "warning": "warning"}.get(sev, "note")
+                  results.append({
+                      "level": level,
+                      "ruleId": rule,
+                      "message": {"text": msg},
+                      "locations": [{"physicalLocation": {
+                          "artifactLocation": {"uri": path.replace("\\", "/"), "uriBaseId": "SRCROOT"},
+                          "region": {"startLine": int(ln), "startColumn": int(col)}
+                      }}]
+                  })
+                  rules.add(rule)
+
+          sarif = {
+              "version": "2.1.0",
+              "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+              "runs": [{
+                  "tool": {"driver": {
+                      "name": "dart analyze",
+                      "informationUri": "https://dart.dev/tools/dart-analyze",
+                      "rules": [{"id": r, "name": r} for r in sorted(rules)]
+                  }},
+                  "originalUriBaseIds": {"SRCROOT": {
+                      "uri": Path(workspace).as_uri(),
+                      "description": {"text": "Source root"}
+                  }},
+                  "results": results
+              }]
+          }
+
+          with open("dart_analyze.sarif", "w") as f:
+              json.dump(sarif, f, indent=2)
+          print(f"SARIF: {len(results)} issues")
+          PY
+
+      - name: Report to DeepSource
+        run: |
+          curl -sL https://deepsource.io/cli | sh
+          ./bin/deepsource report --analyzer dart-analyze --analyzer-type community --value-file ./dart_analyze.sarif
+        env:
+          DEEPSOURCE_DSN: ${{ secrets.DEEPSOURCE_DSN }}
